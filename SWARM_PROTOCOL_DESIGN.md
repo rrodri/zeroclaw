@@ -4,14 +4,16 @@
 
 A protocol for open source projects where contributors submit **intent** (tickets + specs), not code. Autonomous agents generate, validate, and certify all artifacts. Humans act as judges, not laborers.
 
-**This is a standalone event-driven coordination server** — not a feature of any single agent runtime. It orchestrates agents (ZeroClaw, Devin, Cursor, local LLMs, anything) by owning the spec lifecycle, ticket state machine, and routing logic. The server reacts to events (spec amended, PR opened, agent failed) and initiates actions (assign agent, escalate, create ticket). Agents are workers that speak the protocol; the server is the control plane.
+**This is a standalone event-driven coordination server.** It orchestrates headless coding agents (Devin, Factory, Codegen, Claude Code, Cursor, local LLMs — anything with an API) by owning the spec lifecycle, ticket state machine, and routing logic. The server reacts to events (spec amended, PR opened, agent failed) and initiates actions (assign agent, escalate, create ticket). Agents are workers that speak the protocol; the server is the control plane.
+
+**This project does not include an agent runtime.** The agent market is commoditizing — every IDE and AI lab is shipping headless coding agents. Building another one is a losing race. The coordination layer has zero real competitors. We build the dispatch, not the worker.
 
 ---
 
 ## Core Principles
 
 1. **Specs are law** — all generated code is validated against specs, never the reverse
-2. **Agents are labor** — any agent stack (Claude, Cursor, local LLM) can participate
+2. **Agents are labor** — any headless coding agent (Devin, Factory, Codegen, Claude Code, Cursor, local LLM) can participate via adapters
 3. **CI is enforcement** — the only authority on whether output meets spec
 4. **Humans are judges** — intervene only to file intent and resolve ambiguity
 5. **Failed work adds value** — every failed attempt enriches the ticket for the next agent
@@ -529,6 +531,55 @@ UPDATE_SPEC(spec_id, diff, reason) → new_version  # human only
 
 Transport is irrelevant. Git-native (tickets as files in repo), REST API, message queue — the protocol doesn't care. Agents speak the operations, not the transport.
 
+### Agent Adapters
+
+Headless coding agents (Devin, Factory, Codegen, Claude Code, etc.) each have their own API. The server doesn't talk to them directly — it talks through **adapters** that translate between the protocol operations and each agent's native API.
+
+```
+Server ──CLAIM──▶ ┌─────────────┐ ──Devin API──▶ Devin
+                  │  Adapter     │
+Server ──SUBMIT─▶ │  (per agent) │ ──Factory API──▶ Factory
+                  │              │
+Server ◀─REPORT── │  Translates  │ ──Claude CLI──▶ Claude Code
+                  │  protocol ↔  │
+                  │  native API  │ ──Local exec──▶ Local LLM
+                  └─────────────┘
+```
+
+Each adapter implements a single interface:
+
+```go
+type AgentAdapter interface {
+    // Dispatch a certified ticket to the agent
+    Assign(ctx context.Context, ticket Ticket, spec Spec) (AttemptID, error)
+
+    // Poll or receive status updates
+    Status(ctx context.Context, attemptID AttemptID) (AttemptStatus, error)
+
+    // Retrieve artifacts (branch, PR, logs) when attempt completes
+    Collect(ctx context.Context, attemptID AttemptID) (Artifacts, error)
+
+    // Cancel a running attempt
+    Cancel(ctx context.Context, attemptID AttemptID) error
+}
+```
+
+**Shipping adapters:**
+
+| Adapter | Connects to | How |
+|---------|-------------|-----|
+| `devin` | Devin API | REST — create session, attach spec, poll for PR |
+| `factory` | Factory.ai API | REST — submit task, receive webhook on completion |
+| `codegen` | Codegen API | REST — create task from spec |
+| `claude-cli` | Claude Code CLI | Local exec — spawn process, pass spec as prompt, collect git output |
+| `cursor` | Cursor headless | Local exec — workspace + spec injection |
+| `local-llm` | Ollama / vLLM / llama.cpp | Local exec — prompt with spec, run in sandboxed workspace |
+| `custom` | Any agent | Webhook — server posts ticket, agent posts back results |
+
+**Adapters are open source.** They're thin glue — 100-300 lines each. Community contributes new ones. The more adapters exist, the more agents the server can dispatch to, the more valuable the platform.
+
+**The `custom` webhook adapter is the escape hatch.** Any agent that can receive an HTTP POST and return results speaks the protocol. No SDK needed.
+
 ---
 
 ## Spec Linter (`zeroclaw-spec-lint`)
@@ -663,13 +714,16 @@ The server runs as a standalone process (VPS, container, self-hosted). It needs:
 - Persistent storage for state (SQLite/Postgres)
 
 ```
-GitHub ──webhooks──▶ ┌─────────────────┐ ──assign──▶ Agent A (ZeroClaw)
-                     │                 │ ──assign──▶ Agent B (any runtime)
-Specs  ──push────▶   │    Server       │ ──certify─▶ Agent C
-                     │                 │
-Humans ──judge───▶   │  (state +       │ ──lint───▶  Spec linter
-                     │   events +      │
-Agents ──report──▶   │   routing)      │ ──notify──▶ Slack/Discord/etc
+                     ┌─────────────────┐
+GitHub ──webhooks──▶ │                 │ ──adapter──▶ Devin
+                     │                 │ ──adapter──▶ Factory
+Specs  ──push────▶   │    Server       │ ──adapter──▶ Codegen
+                     │    (Go+Dapr)    │ ──adapter──▶ Claude Code
+Humans ──judge───▶   │                 │ ──adapter──▶ Local LLM
+                     │  state machine  │
+Agents ──report──▶   │  ticket actors  │ ──lint───▶  Spec linter
+                     │  adapter pool   │
+                     │                 │ ──notify──▶ Slack/Discord/etc
                      └─────────────────┘
 ```
 
@@ -687,6 +741,7 @@ The protocol and tooling are open. The server is closed.
 | Spec linter (`zeroclaw-spec-lint`) | Adoption driver — teams use it before needing the server |
 | Constraint patterns vocabulary | Must be in everyone's codebase |
 | Agent protocol (CLAIM/SUBMIT/etc) | BYO compute only works if the protocol is public |
+| Agent adapters | Community contributes new ones — more adapters = more agents = more value |
 | GitHub Action sensor | Thin glue, no value closed |
 
 **Closed source:**
@@ -738,9 +793,10 @@ Enables:
 
 ## What This Is Not
 
+- **Not an agent runtime** — the agent market is commoditizing. We don't build workers, we dispatch them.
 - **Not a distributed compute platform** — no shared compute, no trust model needed
 - **Not a CI system** — CI is a dependency, not a replacement
-- **Not an agent framework** — it's a protocol. BYO agent.
+- **Not an agent framework** — it's a protocol + coordination server. BYO agent via adapters.
 - **Not a code review tool** — validation is spec compliance, not style/quality opinions
 
 ---
@@ -750,8 +806,8 @@ Enables:
 | Component | Language | Why |
 |-----------|----------|-----|
 | Coordination server | Go + Dapr | Event-driven, stateful actors (tickets as Dapr actors), first-class Dapr SDK, fast to ship |
+| Agent adapters | Go | Same repo as server, thin translation layer per agent API |
 | Spec linter | Rust + pest | Parsing performance, pest PEG grammar, `.pest` file IS the spec language documentation |
-| Agent runtime (ZeroClaw) | Rust | Already exists, performance-critical |
 | Spec language grammar | `.pest` file | Language-agnostic artifact, consumed by the linter |
 
 **Why Go for the server:**
@@ -784,7 +840,7 @@ Each ticket is a Dapr actor. Dapr handles persistence, activation, deactivation,
 ### Sequence
 
 1. **Ship the linter** (weeks) — open source `zeroclaw-spec-lint`, publish the `.spec` format and pest grammar
-2. **Get adoption** (months) — target 50 repos running the linter in CI. Write 3-5 real specs for ZeroClaw as proof. Record a demo: spec written → linter validates → agent generates code → linter catches violation
+2. **Get adoption** (months) — target 50 repos running the linter in CI. Write 3-5 real specs as proof. Record a demo: spec written → linter validates → agent generates code → linter catches violation
 3. **Ship the server** (months) — build when teams ask for orchestration. The pull should come from adoption, not push
 4. **Monetize** — managed hosting for teams that don't want to operate the server
 
@@ -801,7 +857,7 @@ Each ticket is a Dapr actor. Dapr handles persistence, activation, deactivation,
 
 - Spec format + linter become a standard (network effect)
 - More agents speaking the protocol = more valuable server
-- Agent-runtime agnostic — doesn't compete with ZeroClaw, Devin, Cursor, etc. Coordinates them
+- Agent-runtime agnostic — doesn't compete with Devin, Factory, Cursor, etc. Coordinates them via adapters
 - Dogfooding = own development velocity proves the product
 
 ### Risks
