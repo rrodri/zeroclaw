@@ -123,131 +123,221 @@ When a spec moves from `active` to `amended`, the system auto-creates an impleme
 | Spec changed, code didn't | Spec state = `amended` | Auto-create ticket, no block |
 | Both changed independently | Conflict | Escalate to human judge |
 
-### Language-Native Spec Shadow Tree
+### Universal Spec Language
 
-Specs are written as **compilable interface files in the same language as the source**, not in YAML or a custom DSL. Every source file can have a spec mirror using the `.spec` extension:
+Specs are written in a **language-agnostic format** inspired by Gherkin's readability and math textbook rigor. One format works regardless of whether the implementation is Rust, Go, Python, TypeScript, or anything else. Agents bridge the gap by generating language-specific code and tests from universal specs.
 
-```
-src/                          specs/
-  auth/                         auth/
-    token.rs          ↔           token.rs.spec
-    session.rs        ↔           session.rs.spec
-  gateway/                      gateway/
-    webhook.rs        ↔           webhook.rs.spec
-```
+**Design principles:**
+- Gherkin's `Given/Then` for human readability (most readable structured language, 20+ years of BDD validation)
+- Math textbook `Define` blocks for scoped, referenceable terms (no undefined variables, no contradictions)
+- Fixed constraint vocabulary for machine-parseable precision
+- Breakable cross-references that the linter validates
 
-The `.spec` file contains types, signatures, constants, and doc-comment constraints — no implementation bodies. The native compiler validates structural conformance.
+**Example:**
 
-**Rust** (`token.rs.spec`):
-```rust
-/// SPEC(auth-003): Token refresh retry policy
-///
-/// When a token refresh request fails with a transient error,
-/// the system retries the request.
-pub trait TokenRefreshSpec {
-    /// Retries exactly 3 times
-    /// Backoff: exponential, base=500ms, max=4s
-    const MAX_RETRIES: u32 = 3;
-    const BASE_DELAY_MS: u64 = 500;
-    const MAX_DELAY_MS: u64 = 4000;
+```spec
+spec auth-003 "Token refresh retry policy"
+status active
+version 3
 
-    /// On exhaustion, returns AuthError::RefreshExhausted
-    fn refresh_token(&self, token: &ExpiredToken) -> Result<Token, AuthError>;
+Define
+  transient_error: 5xx, timeout, connection reset
+  client_error: 4xx, malformed request
+  max_retries: 3
+  base_delay: 500ms
+  max_delay: 4s
+  backoff_strategy: exponential
 
-    /// Applies to transient errors only
-    fn is_transient(err: &AuthError) -> bool;
+Given token refresh fails with {transient_error}
+Then retry the request
+  count: exactly {max_retries}
+  backoff: {backoff_strategy}
+  base_delay: {base_delay}
+  max_delay: {max_delay}
+  order: sequential
 
-    /// Does NOT apply to 4xx client errors
-    fn is_client_error(err: &AuthError) -> bool;
-}
-```
+Given retries reach {max_retries}
+Then return {err-001:RefreshExhausted}
+  log at error
 
-**Java** (`FooService.java.spec`):
-```java
-/// SPEC(foo-001): Foo processing pipeline
-public interface FooServiceSpec {
-    static final int MAX_BATCH_SIZE = 100;
-    static final Duration TIMEOUT = Duration.ofSeconds(30);
-    CompletableFuture<FooResult> process(FooRequest request) throws FooException;
-}
-```
+Given each retry attempt
+Then log at warn
+  includes: attempt number, delay duration, error type
 
-**TypeScript** (`userStore.ts.spec`):
-```typescript
-/// SPEC(user-001): User persistence contract
-export interface UserStoreSpec {
-    readonly MAX_CONNECTIONS: 10;
-    get(id: UserId): Promise<User | null>;
-    save(user: User): Promise<void>;
-    // Must not: delete users, only soft-delete
-    softDelete(id: UserId): Promise<void>;
-}
-```
+Given token refresh fails with {client_error}
+Then fail immediately
+  count: exactly 0
+  log at error
+  includes: status code, response body
 
-**Python** (`processor.py.spec`):
-```python
-## SPEC(proc-001): Event processing contract
-class ProcessorSpec(Protocol):
-    MAX_QUEUE_DEPTH: int = 1000
-    FLUSH_INTERVAL_MS: int = 5000
-    def process(self, event: Event) -> ProcessResult: ...
-    def flush(self) -> None: ...
+Boundary
+  applies to: {transient_error}
+  does not apply to: {client_error}
+  does not apply to: initial authentication (only refresh)
+
+Implements
+  src/auth/token.rs
+  src/providers/retry.rs
+
+Depends on
+  net-012 >= 3
+  err-001
 ```
 
-**Go** (`handler.go.spec`):
-```go
-/// SPEC(gw-002): Request handler contract
-type HandlerSpec interface {
-    MaxBodyBytes() int64    // must return 1_048_576
-    Handle(ctx context.Context, req *Request) (*Response, error)
-    // Must not: panic on malformed input
-}
+**A spec it depends on:**
+
+```spec
+spec err-001 "Error type registry"
+status active
+version 5
+
+Define
+  auth_errors: RefreshExhausted, TokenExpired, Unauthorized, Forbidden
+  network_errors: Timeout, ConnectionReset, DnsFailure
+  severity_levels: recoverable, terminal
+
+Given an error is {auth_errors}
+Then classify as domain error
+  severity: terminal
+
+Given an error is {network_errors}
+Then classify as infrastructure error
+  severity: recoverable
+
+Given an unknown error
+Then classify as infrastructure error
+  severity: terminal
+  log at error
+  includes: raw error message, stack context
+
+Boundary
+  applies to: all errors surfaced to callers
+  does not apply to: internal retry logic (retries handle their own errors)
+
+Implements
+  src/errors/types.rs
+  src/errors/classify.rs
 ```
 
-**Why language-native specs:**
-- The spec compiles with the same toolchain — no new parser needed
-- `impl Trait` / `implements Interface` IS the bidirectional link (no `// SPEC(id)` markers needed in source code when using traits/interfaces directly)
-- The compiler rejects structural spec violations at build time
-- Every developer already knows how to write a spec — it's just an interface in their language
+### Grammar
 
-### Verification Pyramid
+The entire grammar fits on a napkin. Parsed by [pest](https://pest.rs) (PEG parser generator for Rust — grammar lives in a `.pest` file, zero-copy parsing, great error messages).
 
 ```
-        ▲
-       / \        Doc comments → agent-generated behavior tests
-      /   \       (runtime verification)
-     /─────\
-    /       \     Associated constants → assertion tests
-   /         \    (compile-time values, runtime assertions)
-  /───────────\
- /             \  Trait/interface signatures → native compiler
-/               \ (compile-time structural verification)
-───────────────────
+spec       := "spec" ID TITLE
+status     := "status" STATE
+version    := "version" INT
+define     := "Define" "\n" (INDENT NAME ":" VALUE)+
+rule       := "Given" TEXT "\n" "Then" TEXT "\n" constraint*
+constraint := INDENT KEY ":" VALUE
+ref        := "{" NAME "}" | "{" SPEC-ID ":" SYMBOL "}"
+boundary   := "Boundary" "\n" scope+
+scope      := INDENT ("applies to:" | "does not apply to:") TEXT
+implements := "Implements" "\n" filepath+
+depends    := "Depends on" "\n" (SPEC-ID (">=" INT)?)+
 ```
 
-Bottom layer is free (compiler). Middle layer is mechanical (constants are directly testable). Top layer needs an agent, but doc comments are scoped to a single method, minimizing ambiguity.
+~10 production rules. ~200 lines of Rust for the parser.
 
-### Constraint Patterns in Doc Comments
+### Reference System
 
-Doc comments use a small vocabulary of structured natural-language constraint patterns that linters can parse and agents can verify:
+References are the key differentiator from Gherkin (which has no reference system at all).
 
-```
-- count: exactly N / at most N / at least N
-- timing: within Xms / after Xms / every Xms
-- on [event]: [action]
-- returns: [type or value]
-- calls: [function/service] with [params]
-- must not: [negative constraint]
-- applies to: [scope]
-- does not apply to: [exclusion]
+**Local references** — terms defined in the same spec:
+```spec
+Define
+  max_retries: 3
+
+Given retries reach {max_retries}    ← resolves to 3
 ```
 
-The ambiguity linter flags weasel words:
+**Cross-spec references** — symbols from another spec:
+```spec
+Then return {err-001:RefreshExhausted}   ← err-001 must exist AND define RefreshExhausted
+```
+
+**Version-pinned dependencies:**
+```spec
+Depends on
+  net-012 >= 3     ← net-012 must exist at version 3 or higher
+```
+
+**What breaks and when:**
+
+| Reference type | Breaks when | Linter error |
+|---|---|---|
+| `{term}` | Term not in `Define` block | `auth-003: undefined reference {max_retires} (typo?)` |
+| `{spec-id:symbol}` | Spec doesn't exist or doesn't define symbol | `auth-003: {err-001:RefreshExhausted} — err-001 has no such define` |
+| `Implements` path | File deleted, moved, renamed | `auth-003: implements target src/auth/token.rs not found` |
+| `Depends on` spec ID | Spec deleted or ID changed | `auth-003: depends on net-012 but no spec with that ID exists` |
+| Version pin | Dependency version too low | `auth-003: depends on net-012 >= 3 but net-012 is version 2` |
+| Circular dependency | `auth-003 → net-012 → auth-003` | `auth-003: circular dependency detected` |
+| Duplicate define | Same name defined twice | `auth-003: duplicate define "timeout"` |
+
+### Constraint Vocabulary
+
+A fixed set of ~20-30 constraint types. Anything outside this vocabulary is a linter error — forces spec authors to be precise.
+
+```
+- count:      exactly N / at most N / at least N
+- timing:     within Xms / after Xms / every Xms
+- backoff:    exponential / linear / fixed
+- base_delay: duration
+- max_delay:  duration
+- size:       at most 1MB / exactly 4096 bytes
+- order:      sequential / parallel / any
+- on failure: return ErrorType / retry / skip / escalate
+- severity:   recoverable / terminal
+- log at:     debug / info / warn / error
+- includes:   comma-separated list of what to include
+- returns:    type or value
+- calls:      function/service with params
+- must not:   negative constraint
+```
+
+**Weasel word detection:**
 ```
 - retries: a few times          ← FAIL: "a few" is ambiguous
 - retries: exactly 3            ← PASS
 - timeout: reasonably fast      ← FAIL: "reasonably" is ambiguous
 - timeout: within 5000ms        ← PASS
+```
+
+### How Agents Use Specs
+
+An agent reads the universal `.spec` file and generates language-specific code + tests. The spec is the same regardless of target language:
+
+**From the spec:**
+```spec
+Given retries reach {max_retries}
+Then return {err-001:RefreshExhausted}
+```
+
+**Agent generates (Rust):**
+```rust
+#[test]
+fn auth_003_exhaustion_returns_correct_error() {
+    let refresher = TokenRefresher::new(mock_always_fail());
+    let result = refresher.refresh_token(&expired_token());
+    assert!(matches!(result, Err(AuthError::RefreshExhausted)));
+}
+```
+
+**Agent generates (TypeScript):**
+```typescript
+test('auth-003: exhaustion returns RefreshExhausted', async () => {
+  const refresher = new TokenRefresher(alwaysFailProvider);
+  await expect(refresher.refresh()).rejects.toThrow(RefreshExhaustedError);
+});
+```
+
+**Agent generates (Go):**
+```go
+func TestAuth003_ExhaustionReturnsCorrectError(t *testing.T) {
+    refresher := NewTokenRefresher(alwaysFailProvider)
+    _, err := refresher.RefreshToken(expiredToken)
+    assert.ErrorIs(t, err, ErrRefreshExhausted)
+}
 ```
 
 ### Spec Index
@@ -257,62 +347,20 @@ A `specs/_index.yaml` manifest is auto-generated by the linter on every pass:
 ```yaml
 specs:
   - id: auth-003
-    file: specs/auth/token.rs.spec
+    file: specs/auth/auth-003.spec
     status: active
-    language: rust
+    version: 3
     implements: [src/auth/token.rs, src/providers/retry.rs]
-  - id: auth-004
-    file: specs/auth/session.rs.spec
-    status: amended
-    language: rust
-    implements: [src/auth/session.rs]
+    depends_on: [net-012, err-001]
+  - id: err-001
+    file: specs/errors/err-001.spec
+    status: active
+    version: 5
+    implements: [src/errors/types.rs, src/errors/classify.rs]
+    depends_on: []
 ```
 
 Agents use the index for fast lookup. The linter regenerates it and fails CI if the committed version doesn't match.
-
-### Legacy YAML Spec Format
-
-For non-code specs (protocol definitions, architecture constraints, cross-cutting concerns), the YAML format remains available:
-
-```yaml
-spec:
-  id: string
-  name: string
-  version: int              # incremented on every human-approved change
-  description: string
-
-  interface:                # what the component exposes
-    inputs:
-      - name: string
-        type: string
-        required: bool
-    outputs:
-      - name: string
-        type: string
-
-  behavior:                 # what it must do
-    - given: string
-      when: string
-      then: string
-
-  constraints:              # what it must not do
-    - string
-
-  dependencies:             # other specs this relies on
-    - spec_ref: string
-      version: ">= N"
-
-  validation_rules:         # machine-enforceable rules checked on every PR
-    - rule: string
-      check: "regex" | "ast" | "test" | "llm_review"
-      target: string        # file glob or module path
-
-  history:                  # audit trail
-    - version: int
-      changed_by: string    # human or "escalation from ticket X"
-      reason: string
-      diff: string
-```
 
 ---
 
@@ -441,13 +489,15 @@ The framework processes its own tickets using this protocol.
 The repository is:
 ```
 repo/
-├── specs/              # source of truth — language-native .spec files
+├── specs/              # source of truth — universal .spec files
 │   ├── auth/
-│   │   ├── token.rs.spec
-│   │   └── session.rs.spec
+│   │   ├── auth-003.spec
+│   │   └── auth-004.spec
 │   ├── gateway/
-│   │   └── webhook.rs.spec
-│   ├── protocol/       # YAML specs for cross-cutting concerns
+│   │   ├── gw-001.spec
+│   │   └── gw-002.spec
+│   ├── errors/
+│   │   └── err-001.spec
 │   └── _index.yaml     # auto-generated manifest
 ├── tickets/            # active ticket queue
 │   ├── pending/
@@ -483,43 +533,89 @@ Transport is irrelevant. Git-native (tickets as files in repo), REST API, messag
 
 ## Spec Linter (`zeroclaw-spec-lint`)
 
-A Rust binary that validates the spec shadow tree. Three passes:
+A Rust binary (using pest for parsing) that validates the universal spec format. Three passes:
 
-1. **Parse** — walk `specs/`, detect language from extension, validate structure
-2. **Cross-ref** — compile `.spec` files with native compilers, verify source files implement the spec interfaces
+1. **Parse** — walk `specs/`, parse each `.spec` file against the pest grammar, validate structure
+2. **Cross-ref** — resolve all `{term}`, `{spec-id:symbol}`, `Implements`, and `Depends on` references across the spec tree
 3. **Index** — rebuild `specs/_index.yaml`, diff against committed version
 
 **Commands:**
 ```bash
-zeroclaw-spec-lint check                      # full validation
-zeroclaw-spec-lint check specs/auth/token.rs.spec  # single spec
-zeroclaw-spec-lint index                      # rebuild index
-zeroclaw-spec-lint ci                         # index + check + nonzero exit on violation
+zeroclaw-spec-lint check                          # full validation
+zeroclaw-spec-lint check specs/auth/auth-003.spec # single spec
+zeroclaw-spec-lint index                          # rebuild index
+zeroclaw-spec-lint ci                             # index + check + nonzero exit on violation
 ```
 
 **Structural checks (per spec file):**
 
 | Rule | Check |
 |------|-------|
-| ID matches heading | `/// SPEC(auth-003):` must appear in the spec file |
-| ID is unique | No two spec files share an ID |
+| Grammar valid | File parses against pest grammar |
 | ID format | Must match `^[a-z]+-\d{3,}$` |
-| Status is valid | One of `draft`, `certified`, `active`, `amended` |
-| Implements paths exist | Every path in the index `implements` list is a real file |
-| Dependencies exist | Every referenced spec ID exists |
-| Spec compiles | Language-native compiler succeeds on the `.spec` file |
+| ID unique | No two spec files share an ID |
+| Status valid | One of `draft`, `certified`, `active`, `amended` |
+| Has boundary | At least one `applies to` or `does not apply to` |
+| Has title | Quoted string present |
+| Constraints known | Every constraint key is in the vocabulary |
+| Defines used | Every `Define` entry is referenced (warning if unused) |
+| No duplicate defines | Same name not defined twice |
 
-**Cross-reference checks (spec ↔ source):**
+**Reference checks (cross-spec):**
 
 | Rule | Check |
 |------|-------|
-| Source satisfies spec | Source file implements the trait/interface defined in `.spec` |
-| No orphan specs | If `status: active`, at least one source file implements it |
-| No weasel words | Doc comments don't contain "should", "might", "usually", "sometimes" |
-| Constants are exact | No `approximately`, no ranges where exact values work |
+| Local refs resolve | Every `{term}` has a matching `Define` entry |
+| Cross refs resolve | Every `{spec-id:symbol}` points to an existing spec with that define |
+| Implements paths exist | Every file path in `Implements` is a real file |
+| Depends on specs exist | Every spec ID in `Depends on` has a `.spec` file |
+| Version pins satisfied | `Depends on net-012 >= 3` fails if net-012 is version 2 |
+| No circular dependencies | Dependency graph is acyclic |
+| No orphan specs | If `status: active`, `Implements` is non-empty |
+| No weasel words | Given/Then/constraint text doesn't contain "should", "might", "usually", "approximately", "sometimes", "reasonably" |
+
+**Example linter output:**
+```
+$ zeroclaw-spec-lint check
+
+specs/auth/auth-003.spec
+  ✓ Grammar valid
+  ✓ ID format valid
+  ✓ All defines used
+  ✓ All references resolve
+  ✓ {err-001:RefreshExhausted} → err-001 defines RefreshExhausted
+  ✓ Implements: src/auth/token.rs exists
+  ✓ Implements: src/providers/retry.rs exists
+  ✓ Depends on: err-001 exists (version 5, need >= 1)
+  ✓ Depends on: net-012 exists (version 3, need >= 3)
+  ✓ Boundary present
+  ✓ No weasel words
+
+specs/errors/err-001.spec
+  ✓ Grammar valid
+  ✓ ID format valid
+  ✓ All defines used
+  ✓ All references resolve
+  ✓ Implements: src/errors/types.rs exists
+  ✓ Implements: src/errors/classify.rs exists
+  ✓ No dependencies
+  ✓ Boundary present
+  ✓ No weasel words
+
+2 specs, 0 errors, 0 warnings
+```
+
+**Error messages (from pest):**
+```
+specs/auth/auth-003.spec:14:3
+  |
+14|   count: approximately 3
+  |          ^^^^^^^^^^^^^
+  = expected duration, integer, or size
+```
 
 **GitHub Action sensor (thin glue):**
-A lightweight Action runs `zeroclaw-spec-lint ci` on PRs touching `specs/` or source files with spec implementations, posts the result as a check, and notifies the server.
+A lightweight Action runs `zeroclaw-spec-lint ci` on PRs touching `specs/` or source files listed in `Implements`, posts the result as a check, and notifies the coordination server.
 
 ---
 
@@ -646,3 +742,74 @@ Enables:
 - **Not a CI system** — CI is a dependency, not a replacement
 - **Not an agent framework** — it's a protocol. BYO agent.
 - **Not a code review tool** — validation is spec compliance, not style/quality opinions
+
+---
+
+## Tech Stack
+
+| Component | Language | Why |
+|-----------|----------|-----|
+| Coordination server | Go + Dapr | Event-driven, stateful actors (tickets as Dapr actors), first-class Dapr SDK, fast to ship |
+| Spec linter | Rust + pest | Parsing performance, pest PEG grammar, `.pest` file IS the spec language documentation |
+| Agent runtime (ZeroClaw) | Rust | Already exists, performance-critical |
+| Spec language grammar | `.pest` file | Language-agnostic artifact, consumed by the linter |
+
+**Why Go for the server:**
+- Dapr SDK is first-class (reference implementation maintained by Microsoft)
+- Goroutines for trivial concurrency across agent connections
+- stdlib `net/http` covers 90% of server needs — no framework required
+- Fast cold start (~5ms), small binary (~10MB)
+- Large hiring pool for server/infrastructure work
+
+**What Dapr provides:**
+
+| Capability | Use case |
+|------------|----------|
+| Pub/sub | Spec events, ticket state changes, agent assignments |
+| State store | Ticket queue, spec index, attempt ledger |
+| Service invocation | Agent ↔ server communication |
+| Bindings | GitHub webhooks, Slack/Discord notifications |
+| Actors | Each ticket as a stateful actor with its own lifecycle state machine |
+| Observability | Distributed tracing across agents and server |
+
+**The Dapr actor model maps to tickets:**
+Each ticket is a Dapr actor. Dapr handles persistence, activation, deactivation, and distribution. The server code only defines state transitions (certify, assign, record attempt, escalate).
+
+**The linter and server don't share a language.** The linter is a CLI binary. The server calls it via exec or exposes it as a Dapr binding. Clean boundary.
+
+---
+
+## Go-To-Market
+
+### Sequence
+
+1. **Ship the linter** (weeks) — open source `zeroclaw-spec-lint`, publish the `.spec` format and pest grammar
+2. **Get adoption** (months) — target 50 repos running the linter in CI. Write 3-5 real specs for ZeroClaw as proof. Record a demo: spec written → linter validates → agent generates code → linter catches violation
+3. **Ship the server** (months) — build when teams ask for orchestration. The pull should come from adoption, not push
+4. **Monetize** — managed hosting for teams that don't want to operate the server
+
+### Who pays
+
+| Segment | Why they need this |
+|---------|-------------------|
+| Teams with 10+ agents running | Need orchestration, not more agents |
+| Open source projects | Contributors bring agents instead of time, maintainers define specs |
+| Regulated industries | Audit trails: spec → certification → implementation → validation |
+| Platform engineering teams | Slots into internal developer platforms |
+
+### Defensibility
+
+- Spec format + linter become a standard (network effect)
+- More agents speaking the protocol = more valuable server
+- Agent-runtime agnostic — doesn't compete with ZeroClaw, Devin, Cursor, etc. Coordinates them
+- Dogfooding = own development velocity proves the product
+
+### Risks
+
+- **GitHub builds it into Actions + Copilot.** Window is ~18-24 months. Speed > perfection.
+- **Spec writing is hard.** Most teams are bad at it. May need an agent that helps write specs from natural language.
+- **Cold start.** Need specs + agents + server before value is visible. Find one team willing to pilot end-to-end.
+
+### Funding path
+
+Ship the linter with adoption traction first. "50 teams run my spec linter in CI and are asking for the server" is a fundable position. A design doc alone is not.
