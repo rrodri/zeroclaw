@@ -18,11 +18,32 @@ Docs-only changes: run markdown lint and link-integrity checks. If touching boot
 
 ## Project Snapshot
 
-ZeroClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
+ZeroClaw has two roles:
 
-Core architecture is trait-driven and modular. Extend by implementing traits and registering in factory modules.
+1. **Agent runtime** — a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
+2. **Spec orchestration server** — an event-driven coordination server for spec-driven development, where contributors submit specs (not code), autonomous agents certify/execute/validate against those specs, and humans act as judges for conflicts.
 
-Key extension points:
+Core architecture is trait-driven and modular. Extend by implementing traits and registering in factory modules. The project dogfoods its own spec-driven protocol.
+
+### Spec-Driven Development Protocol
+
+- Contributors submit specs, not code. Agents certify specs as unambiguous before execution.
+- Agents get N attempts before escalating with learnings. PR validation diffs code against specs.
+- Spec-vs-code conflicts escalate to human judges. Contributors bring their own compute and agent stack.
+
+Spec format: YAML frontmatter + markdown body. Each spec has a unique atomic ID (`{domain}-{NNN}`, e.g., `auth-003`). IDs belong to atomic requirements, not files. Lifecycle: `draft → certified → active → amended → active`. Code links back via `// SPEC(id)` markers with bidirectional validation.
+
+Ticket lifecycle: `open → certifying → ready → assigned → executing → review → merged/failed`.
+
+### Spec Linter (`zeroclaw-spec-lint`)
+
+Validates frontmatter structure, ID uniqueness, and path existence. Cross-references `// SPEC()` markers in code against spec `implements` lists. Rebuilds `specs/_index.yaml` manifest. Commands: `check`, `index`, `ci`.
+
+### Event-Driven Server
+
+Reacts to: spec created/amended, ticket certified, PR opened, agent attempt failed, conflict detected, human judgment received. Initiates: agent assignments, certification requests, lint runs, escalation notifications, auto-ticket creation.
+
+### Extension Points
 
 - `src/providers/traits.rs` (`Provider`)
 - `src/channels/traits.rs` (`Channel`)
@@ -31,6 +52,8 @@ Key extension points:
 - `src/observability/traits.rs` (`Observer`)
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
 - `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
+- `specs/` directory with `_index.yaml` manifest
+- Spec linter binary (`zeroclaw-spec-lint`)
 
 ## Repository Map
 
@@ -46,6 +69,7 @@ Key extension points:
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
 - `src/peripherals/` — hardware peripherals (STM32, RPi GPIO)
 - `src/runtime/` — runtime adapters (currently native)
+- `specs/` — spec files organized by domain, with `_index.yaml` manifest
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
 - `.github/` — CI, templates, automation workflows
 
@@ -53,7 +77,7 @@ Key extension points:
 
 - **Low risk**: docs/chore/tests-only changes
 - **Medium risk**: most `src/**` behavior changes without boundary/security impact
-- **High risk**: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`, access-control boundaries
+- **High risk**: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`, access-control boundaries, `specs/` structure changes, spec linter rules, orchestration event routing
 
 When uncertain, classify as higher risk.
 
